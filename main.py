@@ -1,11 +1,15 @@
 import json
+import logging
 import re
+import time
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from pydantic import BaseModel, HttpUrl
 from scrapling.fetchers import Fetcher, StealthyFetcher
 
 app = FastAPI()
+logger = logging.getLogger("scrapling_api")
 
 SALARY_PATTERN = re.compile(
     r"""
@@ -65,6 +69,17 @@ NOISY_SALARY_CONTEXT_PATTERNS = (
 class ScrapeRequest(BaseModel):
     url: HttpUrl
     dynamic: bool = False
+
+
+def configure_logging() -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="[%(asctime)s] %(levelname)s: %(message)s",
+        )
+
+
+configure_logging()
 
 
 def clean_text(text: str) -> str:
@@ -302,6 +317,17 @@ def detect_blocked_page(title: str, body_text: str) -> str:
     return ""
 
 
+def summarize_page(page) -> dict:
+    summary = {}
+
+    for attribute in ("status", "status_code", "url"):
+        value = getattr(page, attribute, None)
+        if value:
+            summary[attribute] = value
+
+    return summary
+
+
 def fetch_page(url: str, dynamic: bool = False):
     if dynamic:
         return StealthyFetcher.fetch(
@@ -339,16 +365,65 @@ def health_check():
 @app.post("/scrape")
 def scrape(req: ScrapeRequest):
     url = str(req.url)
+    host = urlparse(url).netloc
+    started_at = time.perf_counter()
 
     try:
+        logger.info("scrape start host=%s dynamic=%s url=%s", host, req.dynamic, url)
+
+        fetch_started_at = time.perf_counter()
         page = fetch_page(url, dynamic=req.dynamic)
+        fetch_duration_ms = round((time.perf_counter() - fetch_started_at) * 1000, 2)
+        logger.info(
+            "fetch complete host=%s mode=%s duration_ms=%s page=%s",
+            host,
+            "dynamic" if req.dynamic else "static",
+            fetch_duration_ms,
+            summarize_page(page),
+        )
+
         title, salary, blocked_error = extract_page_data(page)
+        logger.info(
+            "extract complete host=%s mode=%s blocked=%s title_found=%s salary_found=%s",
+            host,
+            "dynamic" if req.dynamic else "static",
+            blocked_error or "none",
+            bool(title),
+            bool(salary),
+        )
 
         if blocked_error and not req.dynamic:
+            logger.warning("fallback triggered host=%s reason=%s", host, blocked_error)
+
+            fallback_started_at = time.perf_counter()
             page = fetch_page(url, dynamic=True)
+            fallback_duration_ms = round((time.perf_counter() - fallback_started_at) * 1000, 2)
+            logger.info(
+                "fetch complete host=%s mode=%s duration_ms=%s page=%s",
+                host,
+                "dynamic_fallback",
+                fallback_duration_ms,
+                summarize_page(page),
+            )
+
             title, salary, blocked_error = extract_page_data(page)
+            logger.info(
+                "extract complete host=%s mode=%s blocked=%s title_found=%s salary_found=%s",
+                host,
+                "dynamic_fallback",
+                blocked_error or "none",
+                bool(title),
+                bool(salary),
+            )
 
         if blocked_error:
+            total_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            logger.warning(
+                "scrape blocked host=%s error=%s total_duration_ms=%s",
+                host,
+                blocked_error,
+                total_duration_ms,
+            )
             return {
                 "title": "",
                 "salary": "",
@@ -356,6 +431,14 @@ def scrape(req: ScrapeRequest):
                 "error": blocked_error,
             }
 
+        total_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.info(
+            "scrape success host=%s title_found=%s salary_found=%s total_duration_ms=%s",
+            host,
+            bool(title),
+            bool(salary),
+            total_duration_ms,
+        )
         return {
             "title": title,
             "salary": salary,
@@ -363,6 +446,14 @@ def scrape(req: ScrapeRequest):
         }
 
     except Exception as exc:
+        total_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.exception(
+            "scrape failed host=%s dynamic=%s total_duration_ms=%s error=%s",
+            host,
+            req.dynamic,
+            total_duration_ms,
+            exc,
+        )
         return {
             "title": "",
             "salary": "",
