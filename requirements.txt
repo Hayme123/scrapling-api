@@ -2,3 +2,6 @@ fastapi
 uvicorn
 scrapling[fetchers]
 pydantic
+pydub
+SpeechRecognition
+playwright-stealth
