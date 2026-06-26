@@ -1,0 +1,222 @@
+# scrapling-api
+
+FastAPI service for scraping job pages, extracting HTML, running Google search collection, and finding matching job links.
+
+## Requirements
+
+- Python 3.12+ for local runs
+- Docker for containerized runs
+- Optional: `cloudflared` for exposing the service through Cloudflare Tunnel
+
+## API Surface
+
+- `GET /` - health check
+- `POST /scrape` - scrape one URL and return extracted fields
+- `POST /scrape/batch` - scrape multiple URLs and return cleaned HTML results
+- `POST /scrape/test` - test multiple URLs and return a CSV response
+- `POST /scrape/html` - scrape one URL and return raw HTML response
+- `POST /search/google` - Google search result extraction
+- `POST /search/google/html` - Google search HTML response
+- `POST /jobs/find-link` - crawl from a start URL and find a matching job posting
+
+## Local Run
+
+Create and activate a virtual environment, then install dependencies:
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+scrapling install
+```
+
+Start the API:
+
+```powershell
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+Health check:
+
+```powershell
+curl http://localhost:8000/
+```
+
+## Build Docker Image
+
+From the repo root:
+
+```powershell
+docker build -t scrapling-api .
+```
+
+## Run Docker Container
+
+Default run:
+
+```powershell
+docker run --rm -p 8000:8000 --name scrapling-api scrapling-api
+```
+
+If port `8000` is already taken on the host, publish the container to a different host port:
+
+```powershell
+docker run --rm -p 8001:8000 --name scrapling-api scrapling-api
+```
+
+The container listens on port `8000` internally. The image entrypoint runs:
+
+```text
+uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${WORKERS:-8}
+```
+
+Useful variants:
+
+```powershell
+docker run --rm -p 8000:8000 --name scrapling-api -e WORKERS=4 scrapling-api
+docker run --rm -p 9000:9000 --name scrapling-api -e PORT=9000 scrapling-api
+docker run -d --restart unless-stopped -p 8000:8000 --name scrapling-api scrapling-api
+```
+
+View logs:
+
+```powershell
+docker logs -f scrapling-api
+```
+
+Stop it:
+
+```powershell
+docker stop scrapling-api
+```
+
+## Example Requests
+
+Scrape one page:
+
+```powershell
+curl -X POST "http://localhost:8000/scrape" `
+  -H "Content-Type: application/json" `
+  -d "{\"url\":\"https://example.com/job-posting\",\"dynamic\":false}"
+```
+
+Batch scrape:
+
+```powershell
+curl -X POST "http://localhost:8000/scrape/batch" `
+  -H "Content-Type: application/json" `
+  -d "{\"urls\":[\"https://example.com/job-1\",\"https://example.com/job-2\"],\"dynamic\":false,\"concurrency\":2}"
+```
+
+Find a job link:
+
+```powershell
+curl -X POST "http://localhost:8000/jobs/find-link" `
+  -H "Content-Type: application/json" `
+  -d "{\"start_url\":\"https://example.com/careers\",\"job_title\":\"Software Engineer\",\"location\":\"Singapore\",\"dynamic\":true,\"max_pages\":25}"
+```
+
+## Expose Through Cloudflare Tunnel
+
+There are two practical ways to expose this service:
+
+### Option 1: Quick Tunnel
+
+This is the fastest way to get a public URL for testing. It does not require DNS changes.
+
+1. Start the API locally or in Docker.
+2. Run:
+
+```powershell
+.\cloudflared.exe tunnel --url http://localhost:8000
+```
+
+If you mapped Docker to a different host port, use that instead:
+
+```powershell
+.\cloudflared.exe tunnel --url http://localhost:8001
+```
+
+`cloudflared` will print a public `https://...trycloudflare.com` URL. That URL forwards traffic to your local API.
+
+### Option 2: Named Tunnel With Your Domain
+
+Use this if you want a stable hostname such as `scrape-api.yourdomain.com`.
+
+1. Authenticate:
+
+```powershell
+.\cloudflared.exe tunnel login
+```
+
+2. Create the tunnel:
+
+```powershell
+.\cloudflared.exe tunnel create scrapling-api
+```
+
+3. Create a DNS route:
+
+```powershell
+.\cloudflared.exe tunnel route dns scrapling-api scrape-api.yourdomain.com
+```
+
+4. Create `config.yml` in a local folder, for example `.cloudflared\config.yml`:
+
+```yaml
+tunnel: scrapling-api
+credentials-file: C:\Users\<your-user>\.cloudflared\<tunnel-id>.json
+
+ingress:
+  - hostname: scrape-api.yourdomain.com
+    service: http://localhost:8000
+  - service: http_status:404
+```
+
+If your Docker container is published to `8001`, change the service URL to `http://localhost:8001`.
+
+5. Run the tunnel:
+
+```powershell
+.\cloudflared.exe tunnel --config .\.cloudflared\config.yml run
+```
+
+Once it is running, your API should be reachable at:
+
+```text
+https://scrape-api.yourdomain.com/
+```
+
+## Cloudflare Notes
+
+- Cloudflare Tunnel exposes the host port, not the internal Docker port. If you ran `-p 8001:8000`, Cloudflare must target `http://localhost:8001`.
+- For production, use a named tunnel instead of a quick tunnel.
+- If the API should stay up after reboot, run both Docker and `cloudflared` as services or process-managed background tasks.
+- If you want to restrict access, put Cloudflare Access in front of the hostname.
+
+## Troubleshooting
+
+Port already allocated:
+
+```powershell
+docker run --rm -p 8001:8000 --name scrapling-api scrapling-api
+```
+
+Find what container is already using port `8000`:
+
+```powershell
+docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Ports}}"
+```
+
+Health check fails:
+
+```powershell
+docker logs -f scrapling-api
+```
+
+If `cloudflared` cannot reach the app, verify the local endpoint first:
+
+```powershell
+curl http://localhost:8000/
+```
