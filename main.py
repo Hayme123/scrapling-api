@@ -687,6 +687,7 @@ def fetch_stealthy_page(
         network_idle=True,
         timeout=90000,
         wait=wait,
+        retries=1,
         dns_over_https=True,
         block_webrtc=True,
         load_dom=True,
