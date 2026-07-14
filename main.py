@@ -116,10 +116,10 @@ GOOGLE_RESULT_EXCLUDED_HOSTS = (
 )
 GOOGLE_RECAPTCHA_MAX_ATTEMPTS = 3
 PROMPT_RESPONSE_STATUS_CODES = {401, 429}
-CLOUDFLARE_MAX_CHALLENGE_ROUNDS = 5
-CLOUDFLARE_CHALLENGE_TIMEOUT_MS = 100_000
-CLOUDFLARE_CHALLENGE_ROUND_TIMEOUT_MS = 20_000
-CLOUDFLARE_CHALLENGE_SETTLE_MS = 2000
+CLOUDFLARE_MAX_CHALLENGE_ROUNDS = 2
+CLOUDFLARE_CHALLENGE_TIMEOUT_MS = 60_000
+CLOUDFLARE_CHALLENGE_ROUND_TIMEOUT_MS = 10_000
+CLOUDFLARE_CHALLENGE_SETTLE_MS = 10_000
 BROWSER_BLOCKED_RESOURCE_TYPES = {
     "font",
     "image",
@@ -818,6 +818,15 @@ class BoundedCloudflareSession(StealthySession):
             self.cloudflare_challenge_attempts += 1
             remaining_ms = max(1, int((deadline - time.perf_counter()) * 1000))
             click_timeout_ms = min(2_000, remaining_ms)
+            logger.warning(
+                "cloudflare challenge round=%s/%s clicked=False url=%s",
+                self.cloudflare_challenge_attempts,
+                CLOUDFLARE_MAX_CHALLENGE_ROUNDS,
+                page.url,
+            )
+
+            page.wait_for_timeout(min(5_000, remaining_ms))
+
             clicked = self._click_cloudflare_challenge(page, click_timeout_ms)
             logger.warning(
                 "cloudflare challenge round=%s/%s clicked=%s url=%s",
