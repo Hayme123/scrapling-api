@@ -122,9 +122,10 @@ GOOGLE_RECAPTCHA_MAX_ATTEMPTS = 3
 PROMPT_RESPONSE_STATUS_CODES = {401, 429}
 CLOUDFLARE_MAX_CHALLENGE_ROUNDS = 2
 CLOUDFLARE_CHALLENGE_TIMEOUT_MS = 240_000
-CLOUDFLARE_CHALLENGE_READY_TIMEOUT_MS = 30_000
-CLOUDFLARE_CHALLENGE_ROUND_1_SETTLE_MS = 60_000
-CLOUDFLARE_CHALLENGE_ROUND_2_SETTLE_MS = 60_000
+CLOUDFLARE_CHALLENGE_READY_TIMEOUT_MS = 10_000
+CLOUDFLARE_CHALLENGE_ROUND_1_SETTLE_MS = 10_000
+CLOUDFLARE_CHALLENGE_ROUND_2_SETTLE_MS = 10_000
+STEALTH_DIRECT_TIMEOUT_MS = 30_000
 BROWSER_BLOCKED_RESOURCE_TYPES = {
     "font",
     "image",
@@ -782,8 +783,19 @@ class BoundedCloudflareSession(StealthySession):
     """Run Cloudflare challenges without Scrapling's recursive retry loop."""
 
     def __init__(self, *args, **kwargs):
+        challenge_timeout_ms = kwargs.pop(
+            "cloudflare_challenge_timeout_ms",
+            CLOUDFLARE_CHALLENGE_TIMEOUT_MS,
+        )
+        session_timeout_ms = kwargs.pop("session_timeout_ms", None)
         self.cloudflare_challenge_attempts = 0
         self.cloudflare_challenge_exhausted = False
+        self.cloudflare_challenge_timeout_ms = challenge_timeout_ms
+        self.session_deadline = (
+            time.perf_counter() + (session_timeout_ms / 1000)
+            if session_timeout_ms is not None
+            else None
+        )
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -908,7 +920,9 @@ class BoundedCloudflareSession(StealthySession):
         return not self._has_cloudflare_challenge(page)
 
     def _cloudflare_solver(self, page) -> None:
-        deadline = time.perf_counter() + (CLOUDFLARE_CHALLENGE_TIMEOUT_MS / 1000)
+        deadline = time.perf_counter() + (self.cloudflare_challenge_timeout_ms / 1000)
+        if self.session_deadline is not None:
+            deadline = min(deadline, self.session_deadline)
 
         while self._has_cloudflare_challenge(page):
             if (
@@ -968,25 +982,25 @@ class BoundedCloudflareSession(StealthySession):
                 return
 
 
-def fetch_stealthy_page(
+def fetch_stealthy_attempt(
     url: str,
-    wait: int = 2000,
-    solve_recaptcha: bool = False,
+    *,
+    wait: int,
+    solve_recaptcha: bool,
+    proxy: dict[str, str] | None,
+    timeout_ms: int,
+    challenge_timeout_ms: int,
+    session_timeout_ms: int | None = None,
 ):
     page_action = maybe_solve_google_recaptcha if solve_recaptcha else None
     solve_cloudflare = "google." not in urlparse(url).netloc.lower()
-    proxy = get_next_stealth_proxy()
-    if proxy:
-        proxy_host = urlparse(proxy["server"]).hostname or "configured"
-        provider = "decodo" if proxy_host.endswith("decodo.com") else "custom"
-        logger.info("stealth proxy selected provider=%s host=%s", provider, proxy_host)
     with BoundedCloudflareSession(
         headless=True,
         solve_cloudflare=solve_cloudflare,
         disable_resources=False,
         block_ads=False,
         network_idle=False,
-        timeout=90000,
+        timeout=timeout_ms,
         wait=wait,
         retries=1,
         dns_over_https=True,
@@ -995,11 +1009,63 @@ def fetch_stealthy_page(
         page_action=page_action,
         page_setup=setup_browser_request_blocking,
         proxy=proxy,
+        cloudflare_challenge_timeout_ms=challenge_timeout_ms,
+        session_timeout_ms=session_timeout_ms,
     ) as session:
         response = session.fetch(url)
         response.meta["cloudflare_challenge_attempts"] = session.cloudflare_challenge_attempts
         response.meta["cloudflare_challenge_exhausted"] = session.cloudflare_challenge_exhausted
         return response
+
+
+def fetch_stealthy_page(
+    url: str,
+    wait: int = 2000,
+    solve_recaptcha: bool = False,
+):
+    direct_error = None
+    try:
+        direct_response = fetch_stealthy_attempt(
+            url,
+            wait=0,
+            solve_recaptcha=solve_recaptcha,
+            proxy=None,
+            timeout_ms=STEALTH_DIRECT_TIMEOUT_MS,
+            challenge_timeout_ms=STEALTH_DIRECT_TIMEOUT_MS,
+            session_timeout_ms=STEALTH_DIRECT_TIMEOUT_MS,
+        )
+    except Exception as exc:
+        direct_response = None
+        direct_error = exc
+        logger.warning(
+            "direct stealth attempt cancelled; retrying with proxy error_type=%s",
+            type(exc).__name__,
+        )
+
+    if direct_response is not None and not direct_response.meta.get("cloudflare_challenge_exhausted"):
+        return direct_response
+
+    if direct_response is not None:
+        logger.warning("direct stealth attempt timed out; retrying with proxy")
+
+    proxy = get_next_stealth_proxy()
+    if proxy:
+        proxy_host = urlparse(proxy["server"]).hostname or "configured"
+        provider = "decodo" if proxy_host.endswith("decodo.com") else "custom"
+        logger.info("stealth proxy selected provider=%s host=%s", provider, proxy_host)
+        return fetch_stealthy_attempt(
+            url,
+            wait=wait,
+            solve_recaptcha=solve_recaptcha,
+            proxy=proxy,
+            timeout_ms=90_000,
+            challenge_timeout_ms=CLOUDFLARE_CHALLENGE_TIMEOUT_MS,
+        )
+
+    if direct_response is not None:
+        return direct_response
+    assert direct_error is not None
+    raise direct_error
 
 
 def summarize_page(page) -> dict:
