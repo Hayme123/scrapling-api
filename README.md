@@ -19,6 +19,8 @@ FastAPI service for scraping job pages, extracting HTML, running Google search c
 - `POST /search/google/html` - Google search HTML response
 - `POST /jobs/find-link` - crawl from a start URL and find a matching job posting
 
+Browser fetches use a bounded Cloudflare challenge policy: up to three challenge rounds within 30 seconds in the same Chromium session. If a challenge reappears after that budget, the response returns promptly with `cloudflare_challenge_exhausted` instead of retrying indefinitely. CAPTCHA challenge resources remain available while ordinary images, fonts, media, stylesheets, and ad domains are blocked.
+
 ## Local Run
 
 Create and activate a virtual environment, then install dependencies:
@@ -49,6 +51,29 @@ From the repo root:
 
 ```powershell
 docker build -t scrapling-api .
+```
+
+## Run with Docker Compose
+
+Build and start the API in the background:
+
+```powershell
+docker compose up -d --build
+```
+
+The API is available at `http://localhost:8000`. Override the host port or worker count when needed:
+
+```powershell
+$env:HOST_PORT=8001
+$env:WORKERS=4
+docker compose up -d --build
+```
+
+View logs or stop the service:
+
+```powershell
+docker compose logs -f api
+docker compose down
 ```
 
 ## Run Docker Container

@@ -16,7 +16,9 @@ from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
-from scrapling.fetchers import Fetcher, StealthyFetcher
+from scrapling.fetchers import Fetcher
+from scrapling.engines._browsers._stealth import StealthySession
+from scrapling.engines.toolbelt.ad_domains import AD_DOMAINS
 
 try:
     import pydub
@@ -113,6 +115,23 @@ GOOGLE_RESULT_EXCLUDED_HOSTS = (
     "policies.google.com",
 )
 GOOGLE_RECAPTCHA_MAX_ATTEMPTS = 3
+PROMPT_RESPONSE_STATUS_CODES = {401, 429}
+CLOUDFLARE_MAX_CHALLENGE_ROUNDS = 5
+CLOUDFLARE_CHALLENGE_TIMEOUT_MS = 50_000
+CLOUDFLARE_CHALLENGE_ROUND_TIMEOUT_MS = 15_000
+CLOUDFLARE_CHALLENGE_SETTLE_MS = 750
+BROWSER_BLOCKED_RESOURCE_TYPES = {
+    "font",
+    "image",
+    "media",
+    "beacon",
+    "object",
+    "imageset",
+    "texttrack",
+    "websocket",
+    "csp_report",
+    "stylesheet",
+}
 HTML_REMOVAL_PATTERNS = (
     re.compile(r"<!--.*?-->", flags=re.DOTALL),
     re.compile(r"<script\b[^>]*>.*?</script>", flags=re.IGNORECASE | re.DOTALL),
@@ -653,6 +672,10 @@ def extract_salary_near_title(body_text: str, title: str) -> str:
 
 
 def detect_blocked_page(page, title: str, body_text: str) -> str:
+    page_meta = getattr(page, "meta", {})
+    if isinstance(page_meta, dict) and page_meta.get("cloudflare_challenge_exhausted"):
+        return "cloudflare_challenge_exhausted"
+
     page_url = clean_text(getattr(page, "url", "")).lower()
     normalized_title = clean_text(title).lower()
     normalized_body = clean_text(body_text).lower()
@@ -673,6 +696,169 @@ def detect_blocked_page(page, title: str, body_text: str) -> str:
     return ""
 
 
+def is_cloudflare_challenge_url(url: str) -> bool:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    return hostname == "challenges.cloudflare.com" or parsed.path.startswith("/cdn-cgi/challenge-platform/")
+
+
+def is_ad_domain(hostname: str) -> bool:
+    hostname = hostname.lower().strip(".")
+    while hostname:
+        if hostname in AD_DOMAINS:
+            return True
+        _, separator, hostname = hostname.partition(".")
+        if not separator:
+            break
+    return False
+
+
+def setup_browser_request_blocking(page) -> None:
+    def handle_route(route) -> None:
+        request = route.request
+        if is_cloudflare_challenge_url(request.url):
+            route.continue_()
+            return
+
+        hostname = urlparse(request.url).hostname or ""
+        if request.resource_type in BROWSER_BLOCKED_RESOURCE_TYPES or is_ad_domain(hostname):
+            route.abort()
+            return
+
+        route.continue_()
+
+    page.route("**/*", handle_route)
+
+
+class BoundedCloudflareSession(StealthySession):
+    """Run Cloudflare challenges without Scrapling's recursive retry loop."""
+
+    def __init__(self, *args, **kwargs):
+        self.cloudflare_challenge_attempts = 0
+        self.cloudflare_challenge_exhausted = False
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _has_cloudflare_challenge(page) -> bool:
+        try:
+            if any("challenges.cloudflare.com" in (frame.url or "").lower() for frame in page.frames):
+                return True
+        except Exception:
+            pass
+
+        try:
+            title = (page.title() or "").lower()
+            if "just a moment" in title or "verifying you are human" in title:
+                return True
+        except Exception:
+            pass
+
+        try:
+            content = (page.content() or "").lower()
+            return any(
+                marker in content
+                for marker in (
+                    "cf-chl-widget",
+                    "cf-challenge-running",
+                    "challenge-platform/h/",
+                    "verify you are human",
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _click_cloudflare_challenge(page, timeout_ms: int) -> bool:
+        challenge_frames = []
+        try:
+            challenge_frames = [
+                frame
+                for frame in page.frames
+                if "challenges.cloudflare.com" in (frame.url or "").lower()
+            ]
+        except Exception:
+            pass
+
+        for frame in reversed(challenge_frames):
+            for selector in ("input[type='checkbox']", "[role='checkbox']"):
+                try:
+                    checkbox = frame.locator(selector).first
+                    if checkbox.count() and checkbox.is_visible(timeout=timeout_ms):
+                        checkbox.click(timeout=timeout_ms)
+                        return True
+                except Exception:
+                    continue
+
+            try:
+                box = frame.frame_element().bounding_box()
+                if box:
+                    page.mouse.click(box["x"] + 27, box["y"] + 27, delay=150)
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    def _cloudflare_solver(self, page) -> None:
+        deadline = time.perf_counter() + (CLOUDFLARE_CHALLENGE_TIMEOUT_MS / 1000)
+
+        while self._has_cloudflare_challenge(page):
+            if (
+                self.cloudflare_challenge_attempts >= CLOUDFLARE_MAX_CHALLENGE_ROUNDS
+                or time.perf_counter() >= deadline
+            ):
+                self.cloudflare_challenge_exhausted = True
+                logger.warning(
+                    "cloudflare challenge exhausted attempts=%s url=%s",
+                    self.cloudflare_challenge_attempts,
+                    page.url,
+                )
+                return
+
+            self.cloudflare_challenge_attempts += 1
+            remaining_ms = max(1, int((deadline - time.perf_counter()) * 1000))
+            click_timeout_ms = min(2_000, remaining_ms)
+            clicked = self._click_cloudflare_challenge(page, click_timeout_ms)
+            logger.warning(
+                "cloudflare challenge round=%s/%s clicked=%s url=%s",
+                self.cloudflare_challenge_attempts,
+                CLOUDFLARE_MAX_CHALLENGE_ROUNDS,
+                clicked,
+                page.url,
+            )
+
+            round_deadline = min(
+                deadline,
+                time.perf_counter() + (CLOUDFLARE_CHALLENGE_ROUND_TIMEOUT_MS / 1000),
+            )
+            while time.perf_counter() < round_deadline:
+                remaining_round_ms = max(1, int((round_deadline - time.perf_counter()) * 1000))
+                page.wait_for_timeout(min(250, remaining_round_ms))
+                if not clicked:
+                    clicked = self._click_cloudflare_challenge(
+                        page,
+                        min(250, remaining_round_ms),
+                    )
+                    if clicked:
+                        logger.info(
+                            "cloudflare challenge clicked round=%s url=%s",
+                            self.cloudflare_challenge_attempts,
+                            page.url,
+                        )
+                if not self._has_cloudflare_challenge(page):
+                    remaining_total_ms = max(0, int((deadline - time.perf_counter()) * 1000))
+                    if remaining_total_ms:
+                        page.wait_for_timeout(min(CLOUDFLARE_CHALLENGE_SETTLE_MS, remaining_total_ms))
+                    if not self._has_cloudflare_challenge(page):
+                        logger.info(
+                            "cloudflare challenge cleared attempts=%s url=%s",
+                            self.cloudflare_challenge_attempts,
+                            page.url,
+                        )
+                        return
+                    break
+
+
 def fetch_stealthy_page(
     url: str,
     wait: int = 2000,
@@ -680,11 +866,12 @@ def fetch_stealthy_page(
 ):
     page_action = maybe_solve_google_recaptcha if solve_recaptcha else None
     solve_cloudflare = "google." not in urlparse(url).netloc.lower()
-    return StealthyFetcher.fetch(
-        url,
+    with BoundedCloudflareSession(
         headless=True,
         solve_cloudflare=solve_cloudflare,
-        network_idle=True,
+        disable_resources=False,
+        block_ads=False,
+        network_idle=False,
         timeout=90000,
         wait=wait,
         retries=1,
@@ -692,7 +879,12 @@ def fetch_stealthy_page(
         block_webrtc=True,
         load_dom=True,
         page_action=page_action,
-    )
+        page_setup=setup_browser_request_blocking,
+    ) as session:
+        response = session.fetch(url)
+        response.meta["cloudflare_challenge_attempts"] = session.cloudflare_challenge_attempts
+        response.meta["cloudflare_challenge_exhausted"] = session.cloudflare_challenge_exhausted
+        return response
 
 
 def summarize_page(page) -> dict:
@@ -1088,6 +1280,7 @@ def fetch_page(
     return Fetcher.get(
         url,
         stealthy_headers=True,
+        retries=1,
     )
 
 
@@ -1138,25 +1331,24 @@ def fetch_page_with_fallback(url: str, dynamic: bool = False):
     effective_dynamic = dynamic or should_force_dynamic(url)
     page = fetch_page(url, dynamic=effective_dynamic)
     title, salary, location, blocked_error = extract_page_data(page)
+    status_code = get_page_status_code(page)
 
-    if blocked_error in {"blocked_by_bot_detection", "blocked_by_login"}:
+    if effective_dynamic or status_code in PROMPT_RESPONSE_STATUS_CODES:
+        return page, title, salary, location, blocked_error
+
+    if status_code != 403 and blocked_error in {"blocked_by_bot_detection", "blocked_by_login"}:
         logger.warning("skip blocked url=%s reason=%s", url, blocked_error)
         return page, title, salary, location, blocked_error
 
-    if blocked_error:
-        if not effective_dynamic:
-            logger.warning("job search fallback triggered url=%s reason=%s", url, blocked_error)
-            page = fetch_stealthy_page(url, wait=8000)
-            title, salary, location, blocked_error = extract_page_data(page)
-
-            if blocked_error in {"blocked_by_bot_detection", "blocked_by_login"}:
-                logger.warning("skip blocked url=%s reason=%s", url, blocked_error)
-                return page, title, salary, location, blocked_error
-
-        if blocked_error:
-            logger.warning("stealth retry triggered url=%s reason=%s", url, blocked_error)
-            page = fetch_stealthy_page(url, wait=12000)
-            title, salary, location, blocked_error = extract_page_data(page)
+    if status_code == 403 or blocked_error:
+        logger.warning(
+            "chromium fallback triggered url=%s status=%s reason=%s",
+            url,
+            status_code,
+            blocked_error or "none",
+        )
+        page = fetch_stealthy_page(url)
+        title, salary, location, blocked_error = extract_page_data(page)
 
     return page, title, salary, location, blocked_error
 
@@ -1173,17 +1365,14 @@ def fetch_page_with_mode_detection(url: str) -> tuple[object, str, str, str, str
     title, salary, location, blocked_error = extract_page_data(page)
     status_code = get_page_status_code(page)
 
+    if status_code in PROMPT_RESPONSE_STATUS_CODES:
+        return page, title, salary, location, blocked_error, "static"
+
     if blocked_error or status_code == 403:
         logger.warning("test fallback triggered url=%s status=%s blocked=%s", url, status_code, blocked_error or "none")
-        page = fetch_stealthy_page(url, wait=8000)
+        page = fetch_stealthy_page(url)
         title, salary, location, blocked_error = extract_page_data(page)
         status_code = get_page_status_code(page)
-
-        if blocked_error or status_code == 403:
-            logger.warning("test stealth retry triggered url=%s status=%s blocked=%s", url, status_code, blocked_error or "none")
-            page = fetch_stealthy_page(url, wait=12000)
-            title, salary, location, blocked_error = extract_page_data(page)
-            status_code = get_page_status_code(page)
 
         if blocked_error or status_code == 403:
             return page, title, salary, location, blocked_error, "403"
