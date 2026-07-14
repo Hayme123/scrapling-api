@@ -876,7 +876,7 @@ def fetch_stealthy_page(
     page_action = maybe_solve_google_recaptcha if solve_recaptcha else None
     solve_cloudflare = "google." not in urlparse(url).netloc.lower()
     with BoundedCloudflareSession(
-        headless=False,
+        headless=True,
         solve_cloudflare=solve_cloudflare,
         disable_resources=False,
         block_ads=False,
