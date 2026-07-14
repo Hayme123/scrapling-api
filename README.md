@@ -21,6 +21,10 @@ FastAPI service for scraping job pages, extracting HTML, running Google search c
 
 Browser fetches use a bounded Cloudflare challenge policy: up to three challenge rounds within 30 seconds in the same Chromium session. If a challenge reappears after that budget, the response returns promptly with `cloudflare_challenge_exhausted` instead of retrying indefinitely. CAPTCHA challenge resources remain available while ordinary images, fonts, media, stylesheets, and ad domains are blocked.
 
+## Stealthy Browser Proxies
+
+Set `STEALTH_PROXIES` in `.env` as comma-separated `host:port:username:password` entries. Each Stealthy Chromium session uses the next proxy in the list. Copy `.env.example` when setting up another environment; do not commit `.env`.
+
 ## Local Run
 
 Create and activate a virtual environment, then install dependencies:

@@ -10,12 +10,14 @@ import time
 import urllib.request
 from html import unescape
 from collections import deque
+from threading import Lock
 from urllib.parse import parse_qs, quote_plus, urldefrag, urljoin, urlparse
 
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
+from dotenv import load_dotenv
 from scrapling.fetchers import Fetcher
 from scrapling.engines._browsers._stealth import StealthySession
 from scrapling.engines.toolbelt.ad_domains import AD_DOMAINS
@@ -29,6 +31,8 @@ try:
     import speech_recognition as sr
 except ImportError:  # pragma: no cover
     sr = None
+
+load_dotenv()
 
 app = FastAPI()
 logger = logging.getLogger("scrapling_api")
@@ -133,6 +137,8 @@ BROWSER_BLOCKED_RESOURCE_TYPES = {
     "csp_report",
     "stylesheet",
 }
+STEALTH_PROXY_POOL: deque[dict[str, str]] = deque()
+STEALTH_PROXY_LOCK = Lock()
 HTML_REMOVAL_PATTERNS = (
     re.compile(r"<!--.*?-->", flags=re.DOTALL),
     re.compile(r"<script\b[^>]*>.*?</script>", flags=re.IGNORECASE | re.DOTALL),
@@ -714,6 +720,47 @@ def is_ad_domain(hostname: str) -> bool:
     return False
 
 
+def load_stealth_proxies(raw_proxies: str | None = None) -> deque[dict[str, str]]:
+    """Parse STEALTH_PROXIES entries in host:port:username:password format."""
+    raw_proxies = raw_proxies if raw_proxies is not None else os.getenv("STEALTH_PROXIES", "")
+    proxies: deque[dict[str, str]] = deque()
+
+    for entry in re.split(r"[\s,]+", raw_proxies.strip()):
+        if not entry:
+            continue
+
+        host, separator, credentials = entry.partition(":")
+        port, separator_2, credentials = credentials.partition(":")
+        username, separator_3, password = credentials.partition(":")
+        if not (host and separator and port.isdigit() and separator_2 and username and separator_3 and password):
+            raise ValueError(
+                "Each STEALTH_PROXIES entry must use host:port:username:password format"
+            )
+
+        proxies.append(
+            {
+                "server": f"http://{host}:{port}",
+                "username": username,
+                "password": password,
+            }
+        )
+
+    return proxies
+
+
+def get_next_stealth_proxy() -> dict[str, str] | None:
+    """Return the next configured proxy without logging credentials."""
+    with STEALTH_PROXY_LOCK:
+        if not STEALTH_PROXY_POOL:
+            STEALTH_PROXY_POOL.extend(load_stealth_proxies())
+        if not STEALTH_PROXY_POOL:
+            return None
+
+        proxy = STEALTH_PROXY_POOL[0]
+        STEALTH_PROXY_POOL.rotate(-1)
+        return proxy.copy()
+
+
 def setup_browser_request_blocking(page) -> None:
     def handle_route(route) -> None:
         request = route.request
@@ -928,6 +975,11 @@ def fetch_stealthy_page(
 ):
     page_action = maybe_solve_google_recaptcha if solve_recaptcha else None
     solve_cloudflare = "google." not in urlparse(url).netloc.lower()
+    proxy = get_next_stealth_proxy()
+    if proxy:
+        proxy_host = urlparse(proxy["server"]).hostname or "configured"
+        provider = "decodo" if proxy_host.endswith("decodo.com") else "custom"
+        logger.info("stealth proxy selected provider=%s host=%s", provider, proxy_host)
     with BoundedCloudflareSession(
         headless=True,
         solve_cloudflare=solve_cloudflare,
@@ -942,6 +994,7 @@ def fetch_stealthy_page(
         load_dom=True,
         page_action=page_action,
         page_setup=setup_browser_request_blocking,
+        proxy=proxy,
     ) as session:
         response = session.fetch(url)
         response.meta["cloudflare_challenge_attempts"] = session.cloudflare_challenge_attempts
