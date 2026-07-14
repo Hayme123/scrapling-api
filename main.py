@@ -117,9 +117,9 @@ GOOGLE_RESULT_EXCLUDED_HOSTS = (
 GOOGLE_RECAPTCHA_MAX_ATTEMPTS = 3
 PROMPT_RESPONSE_STATUS_CODES = {401, 429}
 CLOUDFLARE_MAX_CHALLENGE_ROUNDS = 2
-CLOUDFLARE_CHALLENGE_TIMEOUT_MS = 60_000
-CLOUDFLARE_CHALLENGE_ROUND_TIMEOUT_MS = 10_000
-CLOUDFLARE_CHALLENGE_SETTLE_MS = 10_000
+CLOUDFLARE_CHALLENGE_TIMEOUT_MS = 180_000
+CLOUDFLARE_CHALLENGE_ROUND_TIMEOUT_MS = 30_000
+CLOUDFLARE_CHALLENGE_SETTLE_MS = 120_000
 BROWSER_BLOCKED_RESOURCE_TYPES = {
     "font",
     "image",
@@ -825,7 +825,7 @@ class BoundedCloudflareSession(StealthySession):
                 page.url,
             )
 
-            page.wait_for_timeout(min(5_000, remaining_ms))
+            page.wait_for_timeout(min(10_000, remaining_ms))
 
             clicked = self._click_cloudflare_challenge(page, click_timeout_ms)
             logger.warning(
@@ -876,7 +876,7 @@ def fetch_stealthy_page(
     page_action = maybe_solve_google_recaptcha if solve_recaptcha else None
     solve_cloudflare = "google." not in urlparse(url).netloc.lower()
     with BoundedCloudflareSession(
-        headless=True,
+        headless=False,
         solve_cloudflare=solve_cloudflare,
         disable_resources=False,
         block_ads=False,
