@@ -117,9 +117,10 @@ GOOGLE_RESULT_EXCLUDED_HOSTS = (
 GOOGLE_RECAPTCHA_MAX_ATTEMPTS = 3
 PROMPT_RESPONSE_STATUS_CODES = {401, 429}
 CLOUDFLARE_MAX_CHALLENGE_ROUNDS = 2
-CLOUDFLARE_CHALLENGE_TIMEOUT_MS = 180_000
-CLOUDFLARE_CHALLENGE_ROUND_TIMEOUT_MS = 30_000
-CLOUDFLARE_CHALLENGE_SETTLE_MS = 120_000
+CLOUDFLARE_CHALLENGE_TIMEOUT_MS = 240_000
+CLOUDFLARE_CHALLENGE_READY_TIMEOUT_MS = 30_000
+CLOUDFLARE_CHALLENGE_ROUND_1_SETTLE_MS = 60_000
+CLOUDFLARE_CHALLENGE_ROUND_2_SETTLE_MS = 60_000
 BROWSER_BLOCKED_RESOURCE_TYPES = {
     "font",
     "image",
@@ -768,6 +769,45 @@ class BoundedCloudflareSession(StealthySession):
             return False
 
     @staticmethod
+    def _is_cloudflare_checkbox_ready(page) -> bool:
+        challenge_frames = []
+        try:
+            challenge_frames = [
+                frame
+                for frame in page.frames
+                if "challenges.cloudflare.com" in (frame.url or "").lower()
+            ]
+        except Exception:
+            pass
+
+        for frame in reversed(challenge_frames):
+            for selector in ("input[type='checkbox']", "[role='checkbox']"):
+                try:
+                    checkbox = frame.locator(selector).first
+                    if checkbox.count() and checkbox.is_visible():
+                        return True
+                except Exception:
+                    continue
+
+        return False
+
+    def _wait_for_cloudflare_widget_ready(self, page, deadline: float) -> bool:
+        """Wait for a visible Turnstile checkbox before dispatching a click."""
+        ready_deadline = min(
+            deadline,
+            time.perf_counter() + (CLOUDFLARE_CHALLENGE_READY_TIMEOUT_MS / 1000),
+        )
+
+        while time.perf_counter() < ready_deadline:
+            if self._is_cloudflare_checkbox_ready(page):
+                return True
+
+            remaining_ms = max(1, int((ready_deadline - time.perf_counter()) * 1000))
+            page.wait_for_timeout(min(250, remaining_ms))
+
+        return self._is_cloudflare_checkbox_ready(page)
+
+    @staticmethod
     def _click_cloudflare_challenge(page, timeout_ms: int) -> bool:
         challenge_frames = []
         try:
@@ -783,9 +823,9 @@ class BoundedCloudflareSession(StealthySession):
             for selector in ("input[type='checkbox']", "[role='checkbox']"):
                 try:
                     checkbox = frame.locator(selector).first
-                    if checkbox.count() and checkbox.is_visible(timeout=timeout_ms):
-                        checkbox.click(timeout=timeout_ms)
-                        return True
+                    checkbox.wait_for(state="visible", timeout=timeout_ms)
+                    checkbox.click(timeout=timeout_ms)
+                    return True
                 except Exception:
                     continue
 
@@ -798,6 +838,27 @@ class BoundedCloudflareSession(StealthySession):
                 continue
 
         return False
+
+    def _wait_for_cloudflare_clearance(
+        self,
+        page,
+        deadline: float,
+        settle_timeout_ms: int,
+    ) -> bool:
+        """Poll until Cloudflare leaves the interstitial, or the settle window ends."""
+        settle_deadline = min(
+            deadline,
+            time.perf_counter() + (settle_timeout_ms / 1000),
+        )
+
+        while time.perf_counter() < settle_deadline:
+            if not self._has_cloudflare_challenge(page):
+                return True
+
+            remaining_ms = max(1, int((settle_deadline - time.perf_counter()) * 1000))
+            page.wait_for_timeout(min(250, remaining_ms))
+
+        return not self._has_cloudflare_challenge(page)
 
     def _cloudflare_solver(self, page) -> None:
         deadline = time.perf_counter() + (CLOUDFLARE_CHALLENGE_TIMEOUT_MS / 1000)
@@ -819,53 +880,45 @@ class BoundedCloudflareSession(StealthySession):
             remaining_ms = max(1, int((deadline - time.perf_counter()) * 1000))
             click_timeout_ms = min(2_000, remaining_ms)
             logger.warning(
-                "cloudflare challenge round=%s/%s clicked=False url=%s",
+                "cloudflare challenge round=%s/%s waiting_for_widget url=%s",
                 self.cloudflare_challenge_attempts,
                 CLOUDFLARE_MAX_CHALLENGE_ROUNDS,
                 page.url,
             )
 
-            page.wait_for_timeout(min(10_000, remaining_ms))
+            page.wait_for_timeout(min(2_000, remaining_ms))
 
-            clicked = self._click_cloudflare_challenge(page, click_timeout_ms)
+            widget_ready = self._wait_for_cloudflare_widget_ready(page, deadline)
+            click_dispatched = (
+                self._click_cloudflare_challenge(page, click_timeout_ms)
+                if widget_ready
+                else False
+            )
             logger.warning(
-                "cloudflare challenge round=%s/%s clicked=%s url=%s",
+                "cloudflare challenge round=%s/%s widget_ready=%s click_dispatched=%s url=%s",
                 self.cloudflare_challenge_attempts,
                 CLOUDFLARE_MAX_CHALLENGE_ROUNDS,
-                clicked,
+                widget_ready,
+                click_dispatched,
                 page.url,
             )
 
-            round_deadline = min(
-                deadline,
-                time.perf_counter() + (CLOUDFLARE_CHALLENGE_ROUND_TIMEOUT_MS / 1000),
+            settle_timeout_ms = (
+                CLOUDFLARE_CHALLENGE_ROUND_1_SETTLE_MS
+                if self.cloudflare_challenge_attempts == 1
+                else CLOUDFLARE_CHALLENGE_ROUND_2_SETTLE_MS
             )
-            while time.perf_counter() < round_deadline:
-                remaining_round_ms = max(1, int((round_deadline - time.perf_counter()) * 1000))
-                page.wait_for_timeout(min(250, remaining_round_ms))
-                if not clicked:
-                    clicked = self._click_cloudflare_challenge(
-                        page,
-                        min(250, remaining_round_ms),
-                    )
-                    if clicked:
-                        logger.info(
-                            "cloudflare challenge clicked round=%s url=%s",
-                            self.cloudflare_challenge_attempts,
-                            page.url,
-                        )
-                if not self._has_cloudflare_challenge(page):
-                    remaining_total_ms = max(0, int((deadline - time.perf_counter()) * 1000))
-                    if remaining_total_ms:
-                        page.wait_for_timeout(min(CLOUDFLARE_CHALLENGE_SETTLE_MS, remaining_total_ms))
-                    if not self._has_cloudflare_challenge(page):
-                        logger.info(
-                            "cloudflare challenge cleared attempts=%s url=%s",
-                            self.cloudflare_challenge_attempts,
-                            page.url,
-                        )
-                        return
-                    break
+            if click_dispatched and self._wait_for_cloudflare_clearance(
+                page,
+                deadline,
+                settle_timeout_ms,
+            ):
+                logger.info(
+                    "cloudflare challenge cleared attempts=%s url=%s",
+                    self.cloudflare_challenge_attempts,
+                    page.url,
+                )
+                return
 
 
 def fetch_stealthy_page(
