@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import time
 import urllib.request
@@ -136,30 +137,11 @@ BROWSER_BLOCKED_RESOURCE_TYPES = {
     "texttrack",
     "websocket",
     "csp_report",
-    "stylesheet",
 }
 STEALTH_PROXY_POOL: deque[dict[str, str]] = deque()
 STEALTH_PROXY_LOCK = Lock()
-HTML_REMOVAL_PATTERNS = (
-    re.compile(r"<!--.*?-->", flags=re.DOTALL),
-    re.compile(r"<script\b[^>]*>.*?</script>", flags=re.IGNORECASE | re.DOTALL),
-    re.compile(r"<style\b[^>]*>.*?</style>", flags=re.IGNORECASE | re.DOTALL),
-    re.compile(r"<noscript\b[^>]*>.*?</noscript>", flags=re.IGNORECASE | re.DOTALL),
-    re.compile(r"<iframe\b[^>]*>.*?</iframe>", flags=re.IGNORECASE | re.DOTALL),
-    re.compile(r"<svg\b[^>]*>.*?</svg>", flags=re.IGNORECASE | re.DOTALL),
-    re.compile(r"<template\b[^>]*>.*?</template>", flags=re.IGNORECASE | re.DOTALL),
-    re.compile(r"<canvas\b[^>]*>.*?</canvas>", flags=re.IGNORECASE | re.DOTALL),
-)
-HTML_TAG_COMPACT_PATTERN = re.compile(r">\s+<")
-HTML_WHITESPACE_PATTERN = re.compile(r"\s{2,}")
-HTML_ATTRIBUTED_BOILERPLATE_PATTERN = re.compile(
-    r"<(?P<tag>[a-z0-9]+)\b[^>]*\b(?:id|class|data-testid|aria-label)\s*=\s*"
-    r'(?:"[^"]*(cookie|consent|banner|modal|popup|overlay|newsletter|subscribe|sign[\s_-]?in|login)[^"]*"'
-    r"|'[^']*(cookie|consent|banner|modal|popup|overlay|newsletter|subscribe|sign[\s_-]?in|login)[^']*')[^>]*>"
-    r".*?</(?P=tag)>",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-MAX_CLEAN_HTML_LENGTH = 100_000
+HTML_TO_MARKDOWN_COMMAND = os.getenv("HTML_TO_MARKDOWN_COMMAND", "html2markdown")
+HTML_TO_MARKDOWN_TIMEOUT_SECONDS = 30
 
 
 class ScrapeRequest(BaseModel):
@@ -1472,30 +1454,31 @@ def get_page_html(page) -> str:
         return str(page)
 
 
-def clean_html_fragment(html: str) -> str:
-    html = (html or "").strip()
+def html_to_markdown_content(html: str) -> str:
     if not html:
         return ""
+    try:
+        completed = subprocess.run(
+            [HTML_TO_MARKDOWN_COMMAND],
+            input=html,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=HTML_TO_MARKDOWN_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "html2markdown executable not found; rebuild the Docker image or add it to PATH"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("html2markdown conversion timed out") from exc
+    except subprocess.CalledProcessError as exc:
+        error = exc.stderr.strip() or "unknown error"
+        raise RuntimeError(f"html2markdown conversion failed: {error}") from exc
 
-    cleaned = html
-    for pattern in HTML_REMOVAL_PATTERNS:
-        cleaned = pattern.sub("", cleaned)
-
-    cleaned = HTML_ATTRIBUTED_BOILERPLATE_PATTERN.sub("", cleaned)
-    cleaned = re.sub(r"\s(?:on[a-z]+|style)=('([^']*)'|\"([^\"]*)\")", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s(?:data-[a-z0-9_-]+)=('([^']*)'|\"([^\"]*)\")", "", cleaned, flags=re.IGNORECASE)
-    cleaned = HTML_TAG_COMPACT_PATTERN.sub("><", cleaned)
-    cleaned = HTML_WHITESPACE_PATTERN.sub(" ", cleaned)
-    cleaned = cleaned.strip()
-
-    if len(cleaned) > MAX_CLEAN_HTML_LENGTH:
-        cleaned = cleaned[:MAX_CLEAN_HTML_LENGTH].rstrip() + "\n<!-- truncated -->"
-
-    return cleaned
-
-
-def get_clean_page_html(page) -> str:
-    return clean_html_fragment(get_page_html(page))
+    return completed.stdout
 
 
 def extract_page_data(page) -> tuple[str, str, str, str]:
@@ -1794,7 +1777,7 @@ async def scrape_html_with_limit(
     async with semaphore:
         result = await run_in_threadpool(scrape_html_result, url, dynamic)
         return {
-            "content": clean_html_fragment(result.get("content", "")),
+            "content": html_to_markdown_content(result.get("content", "")),
             "status_code": result.get("status_code"),
             "source": result.get("source"),
             "duration_ms": result.get("duration_ms"),

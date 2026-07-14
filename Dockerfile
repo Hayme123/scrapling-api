@@ -1,3 +1,7 @@
+FROM golang:1.25-bookworm AS html-to-markdown-builder
+
+RUN go install github.com/JohannesKaufmann/html-to-markdown/v2/cli/html2markdown@v2.5.2
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -5,6 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
+
+COPY --from=html-to-markdown-builder /go/bin/html2markdown /usr/local/bin/html2markdown
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
