@@ -2,6 +2,7 @@ fastapi
 uvicorn
 scrapling[fetchers]==0.4.8
 pydantic
+python-dotenv
 pydub
 SpeechRecognition
 playwright-stealth
